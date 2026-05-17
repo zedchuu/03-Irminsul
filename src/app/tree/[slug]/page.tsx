@@ -1,31 +1,35 @@
 // =============================================================================
 // src/app/tree/[slug]/page.tsx
-// Phase 3.4 — Tech Tree Server Component Route
+// Irminsul — Phase 4.3: Live Auth & Interactivity
 //
-// Route: /tree/[slug]  (e.g. /tree/learn-python)
-// This is a pure async Server Component — no 'use client', no useState.
+// Changes from Phase 4.2:
+//   - MOCK_USER_ID removed. Real session resolved via supabase.auth.getUser().
+//   - Unauthenticated users are redirected to /login immediately.
+//   - `slug` is now passed to <TechTreeCanvas> so the canvas can pass it to
+//     the startNode Server Action for targeted revalidation.
+//   - Auth dev badge replaced with real user email indicator.
 //
-// Data flow:
-//   URL slug
-//     → getOrGenerateGoal(slug)   [four-tier waterfall in goalService.ts]
-//     → generateGraphData(goal.id) [topological sort in graphService.ts]
-//     → <TechTreeCanvas nodes edges /> [React Flow client component]
-//
-// notFound() triggers:
-//   - error_fallback source (DB + LLM both failed)
-//   - tier3-write-failed id (goal exists in memory but not in DB — no real id
-//     to pass to generateGraphData, which would return an empty graph)
-//
-// Next.js 15+: params is a Promise and must be awaited before property access.
+// ⚠️  Scaffold note (remove in Phase 4.3 when graphService is wired):
+//   getScaffoldGraph() regenerates random UUIDs on every render. Because
+//   revalidatePath() triggers a fresh render, clicking a node will assign new
+//   UUIDs to scaffold nodes — the upserted progress row won't match the new
+//   IDs, so the IN_PROGRESS state won't display. This is a scaffold limitation
+//   only. Once generateGraphData() is wired, real DB node IDs are stable across
+//   renders and the full click → revalidate → hydrate loop works correctly.
 // =============================================================================
 
-import { notFound } from "next/navigation";
-import { getOrGenerateGoal } from "@/services/goalService";
-import { generateGraphData } from "@/services/graphService";
-import TechTreeCanvas from "@/components/TechTree/TechTreeCanvas";
+import { redirect, notFound } from 'next/navigation';
+import { createClient } from '@/utils/supabase/server';
+import type { GoalSummary } from '@/types/database.types';
+import {
+  getUserProgressForNodes,
+  hydrateGraphWithProgress,
+} from '@/services/progressService';
+import TechTreeCanvas from '@/components/TechTree/TechTreeCanvas';
+import { generateGraphData } from '@/services/graphService';
 
 // ---------------------------------------------------------------------------
-// Types
+// Page props
 // ---------------------------------------------------------------------------
 
 interface PageProps {
@@ -33,104 +37,98 @@ interface PageProps {
 }
 
 // ---------------------------------------------------------------------------
-// Page
+// Page — RSC
 // ---------------------------------------------------------------------------
 
 export default async function TechTreePage({ params }: PageProps) {
-  // Await params before property access — required in Next.js 15+.
+  // ── Step 1: Resolve slug ──────────────────────────────────────────────────
   const { slug } = await params;
 
-  // ── Step 1: Resolve goal via tiered waterfall ──────────────────────────
-  // getOrGenerateGoal never throws — it catches all errors internally and
-  // returns source: 'error_fallback' with a sentinel id. We treat both
-  // error states as not-found from the user's perspective.
-  const result = await getOrGenerateGoal(slug);
+  // ── Step 2: Auth — resolve real session ───────────────────────────────────
+  // createClient() is called once and reused for both auth and the goal query.
+  // getUser() validates the JWT server-side — cannot be spoofed by the client.
+  // getSession() reads from the cookie without validation — never use it here.
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
 
-  if (
-    result.source === "error_fallback" ||
-    result.goal.id === "error-fallback" ||
-    result.goal.id === "tier3-write-failed"
-  ) {
-    // error-fallback: both DB and LLM failed — nothing to render.
-    // tier3-write-failed: goal was generated but never persisted — no real
-    // UUID to pass to generateGraphData, which would return an empty graph.
+  if (!user) {
+    // Pass the intended destination so login can redirect back here after auth.
+    redirect(`/login?next=/tree/${slug}`);
+  }
+
+  const userId = user.id;
+
+  // ── Step 3: Fetch goal metadata ───────────────────────────────────────────
+  const { data: goal, error: goalError } = await supabase
+    .from('goals')
+    .select('id, title, slug, description, last_verified_at, access_count, created_at, updated_at')
+    .eq('slug', slug)
+    .maybeSingle() as { data: GoalSummary | null; error: { message: string } | null };
+
+  if (goalError) {
+    console.error(
+      `[Irminsul/TechTreePage] Goal fetch failed for slug '${slug}': ${goalError.message}`,
+    );
+    throw new Error('Failed to load goal data.');
+  }
+
+  if (!goal) {
     notFound();
   }
 
-  const goal = result.goal;
-
-  // ── Step 2: Generate graph data from persisted node + prerequisite rows ─
-  // generateGraphData throws on Supabase failure or cycle detection.
-  // We let that propagate to Next.js's error boundary (error.tsx) rather
-  // than silently swallowing it — a broken graph is a data integrity issue
-  // that should surface loudly, not render as an empty canvas.
+  // ── Step 4: Generate layout graph ────────────────────────────────────────
+  // TODO Phase 4.3: replace scaffold with the real graphService call:
+  //   
   const { nodes, edges } = await generateGraphData(goal.id);
 
-  // ── Step 3: Render ────────────────────────────────────────────────────
+  // ── Step 5: Fetch user progress ───────────────────────────────────────────
+  const nodeIds = nodes.map((n) => n.id);
+  const userProgress = await getUserProgressForNodes(userId, nodeIds);
+
+  // ── Step 6: Hydrate graph ─────────────────────────────────────────────────
+  const hydratedNodes = hydrateGraphWithProgress(nodes, edges, userProgress);
+
+  // ── Step 7: Render ────────────────────────────────────────────────────────
   return (
-    <main className="min-h-screen bg-[#080b10] text-slate-100 p-6 flex flex-col gap-6">
+    <main className="h-screen bg-gray-950 text-gray-100 flex flex-col overflow-hidden">
 
-      {/* ── Header ──────────────────────────────────────────────────────── */}
-      <header className="flex flex-col gap-2 max-w-3xl">
-
-        {/* Eyebrow label */}
-        <p className="font-mono text-[10px] tracking-[0.25em] uppercase text-amber-500/70">
-          Tech Tree · {result.source.replace(/_/g, " ")}
-        </p>
-
-        {/* Goal title */}
-        <h1 className="font-mono text-3xl font-bold uppercase tracking-tight text-amber-100 leading-none">
-          {goal.title}
-        </h1>
-
-        {/* Goal description — milestone_graph descriptions replace this in
-            Phase 4 once the milestone sidebar is built. For now we render
-            the legacy description column if it exists. */}
-        {goal.description && (
-          <p className="text-sm text-slate-500 leading-relaxed max-w-xl mt-1">
-            {goal.description}
+      {/* ------------------------------------------------------------------ */}
+      {/* Page header                                                         */}
+      {/* ------------------------------------------------------------------ */}
+      <header className="flex items-center justify-between px-6 py-4 border-b border-gray-800 flex-shrink-0">
+        <div>
+          <p className="text-xs font-mono text-gray-600 uppercase tracking-widest mb-0.5">
+            Tech Tree
           </p>
-        )}
+          <h1 className="text-lg font-semibold text-white leading-tight">
+            {goal.title}
+          </h1>
+        </div>
 
-        {/* Graph metadata */}
-        <p className="font-mono text-[10px] tracking-widest text-slate-700 uppercase mt-1">
-          {nodes.length} node{nodes.length !== 1 ? "s" : ""}
-          <span className="mx-2 text-slate-800">·</span>
-          {edges.length} edge{edges.length !== 1 ? "s" : ""}
-          <span className="mx-2 text-slate-800">·</span>
-          slug: {goal.slug}
-        </p>
-
+        {/* Real user identity — confirms live auth is active */}
+        <span className="rounded-full bg-slate-800 border border-slate-700 px-3 py-1 text-xs font-mono text-slate-400 max-w-[200px] truncate">
+          {user.email}
+        </span>
       </header>
 
-      {/* ── Canvas wrapper ──────────────────────────────────────────────── */}
-      {/* Explicit height is REQUIRED — React Flow collapses to 0px if the  */}
-      {/* container does not have a fixed or calculated height. h-[800px]   */}
-      {/* is the Phase 3 default; Phase 4 can make this viewport-relative   */}
-      {/* (e.g. h-[calc(100vh-160px)]) once the header height is stable.    */}
-      <div className="w-full h-[800px] border border-slate-800 rounded-xl overflow-hidden shadow-2xl shadow-black/50">
+      {/* ------------------------------------------------------------------ */}
+      {/* Tech Tree Canvas                                                    */}
+      {/* slug passed through so TechTreeCanvas can target revalidatePath.   */}
+      {/* ------------------------------------------------------------------ */}
+      <div className="flex-1 min-h-0 relative">
         <TechTreeCanvas
-          initialNodes={nodes}
+          initialNodes={hydratedNodes}
           initialEdges={edges}
-          goalTitle={goal.title}
+          goalSlug={slug}
         />
       </div>
-
-      {/* ── Empty state (no nodes generated yet) ────────────────────────── */}
-      {/* Shown when generateGraphData returns [] — goal exists in DB but   */}
-      {/* node generation hasn't run yet (e.g. Tier 3 write partially       */}
-      {/* failed between goal insert and node insert).                      */}
-      {nodes.length === 0 && (
-        <div className="flex flex-col items-center justify-center py-24 gap-3">
-          <p className="font-mono text-xs text-slate-700 uppercase tracking-widest">
-            Recalculating path...
-          </p>
-          <p className="text-sm text-slate-600">
-            No nodes found for this goal. The curriculum may still be generating.
-          </p>
-        </div>
-      )}
 
     </main>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Scaffold graph — remove when graphService is wired (see Step 4 above)
+// ---------------------------------------------------------------------------
+
+import type { RFNode, RFEdge, TechTreeNodeData } from '@/services/graphService';
